@@ -9,10 +9,12 @@ import com.limelight.nvstream.jni.MoonBridge
 import com.limelight.nvstream.jni.MoonBridge.AudioConfiguration
 import com.limelight.preferences.PreferenceConfiguration.AnalogStickForScrolling
 import com.limelight.preferences.PreferenceConfiguration.FormatOption
+import com.limelight.preferences.StreamSettings.Companion.displayCutoutP
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.text.toInt
 
 class PreferenceConfiguration {
     enum class FormatOption {
@@ -198,7 +200,9 @@ class PreferenceConfiguration {
         const val RES_1080P: String = "1920x1080"
         const val RES_1440P: String = "2560x1440"
         const val RES_4K: String = "3840x2160"
-        const val RES_NATIVE: String = "Native"
+        const val RES_NATIVE = "native"
+        const val RES_NATIVE_CUTOUT = "native cutout"
+        const val RES_NATIVE_FULLSCREEN = "native fullscreen"
 
         fun isNativeResolution(width: Int, height: Int): Boolean {
             // It's not a native resolution if it matches an existing resolution option
@@ -263,16 +267,6 @@ class PreferenceConfiguration {
             }
         }
 
-        private fun getWidthFromResolutionString(resString: String): Int {
-            return resString.split("x".toRegex()).dropLastWhile { it.isEmpty() }
-                .toTypedArray()[0].toInt()
-        }
-
-        private fun getHeightFromResolutionString(resString: String): Int {
-            return resString.split("x".toRegex()).dropLastWhile { it.isEmpty() }
-                .toTypedArray()[1].toInt()
-        }
-
         private fun getResolutionString(width: Int, height: Int): String {
             return when (height) {
                 360 -> RES_360P
@@ -285,9 +279,9 @@ class PreferenceConfiguration {
             }
         }
 
-        fun getDefaultBitrate(resString: String, fpsString: String): Int {
-            val width = getWidthFromResolutionString(resString)
-            val height = getHeightFromResolutionString(resString)
+        fun getDefaultBitrate(res: Pair<Int, Int>?, fpsString: String): Int {
+            val width = res?.first ?: 1280
+            val height = res?.second ?: 720
             val fps = fpsString.toInt()
 
             // This logic is shamelessly stolen from Moonlight Qt:
@@ -295,8 +289,11 @@ class PreferenceConfiguration {
 
             // Don't scale bitrate linearly beyond 60 FPS. It's definitely not a linear
             // bitrate increase for frame rate once we get to values that high.
-            val frameRateFactor =
-                (if (fps <= 60) fps.toFloat() else (sqrt((fps / 60f)) * 60f)) / 30f
+            val frameRateFactor = if (fps <= 60) {
+                fps / 30f
+            } else {
+                (sqrt(fps.toFloat() / 60f) * 60f) / 30f
+            }
 
             // TODO: Collect some empirical data to see if these defaults make sense.
             // We're just using the values that the Shield used, as we have for years.
@@ -345,7 +342,7 @@ class PreferenceConfiguration {
                 i++
             }
 
-            return (resolutionFactor * frameRateFactor).roundToInt().toInt() * 1000
+            return (resolutionFactor * frameRateFactor).roundToInt() * 1000
         }
 
         @JvmStatic
@@ -373,10 +370,10 @@ class PreferenceConfiguration {
         fun getDefaultBitrate(context: Context?): Int {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
             return getDefaultBitrate(
-                prefs.getString(
+                parsePrefResolutionValue(prefs.getString(
                     RESOLUTION_PREF_STRING,
                     DEFAULT_RESOLUTION
-                )!!,
+                )!!).second,
                 prefs.getString(
                     FPS_PREF_STRING,
                     DEFAULT_FPS
@@ -486,10 +483,47 @@ class PreferenceConfiguration {
                     Build.FINGERPRINT.contains("PPR1.180610.011/4079208_2235.1395")
         }
 
+        fun parsePrefResolutionValue(value: String): Pair<String?, Pair<Int, Int>?> {
+            val parts = value.split("|")
+            return when (parts.size) {
+                1 -> {
+                    // Only resolution part is present
+                    val resolution = parseResolution(parts[0])
+                    Pair("standard", resolution)
+                }
+                2 -> {
+                    // Both mode and resolution parts are present
+                    val resolution = parseResolution(parts[1])
+                    Pair(parts[0], resolution)
+                }
+                else -> Pair(null, null) // Invalid format
+            }
+        }
+
+        fun parseResolution(resolution: String): Pair<Int, Int>? {
+            return try {
+                val dimensions = resolution.split("x").map { it.toInt() }
+                if (dimensions.size == 2) {
+                    Pair(dimensions[0], dimensions[1])
+                } else {
+                    null
+                }
+            } catch (e: NumberFormatException) {
+                null
+            }
+        }
+
         @JvmStatic
         fun readPreferences(context: Context): PreferenceConfiguration {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
             val config = PreferenceConfiguration()
+
+            // Handle the new resolution format
+            val resolutionValue = prefs.getString(RESOLUTION_PREF_STRING, DEFAULT_RESOLUTION)!!
+            val (mode, resolution) = parsePrefResolutionValue(resolutionValue)
+
+            config.width = resolution?.first ?: 1280
+            config.height = resolution?.second ?: 720
 
             // Migrate legacy preferences to the new locations
             if (prefs.contains(LEGACY_ENABLE_51_SURROUND_PREF_STRING)) {
@@ -552,19 +586,35 @@ class PreferenceConfiguration {
                     .apply()
             } else {
                 // Use the new preference location
-                var resStr: String = prefs.getString(
+                val resStrOg = prefs.getString(
                     RESOLUTION_PREF_STRING,
                     DEFAULT_RESOLUTION
                 )!!
+                val res = parsePrefResolutionValue(resStrOg).second
 
                 // Convert legacy resolution strings to the new style
-                if (!resStr.contains("x")) {
-                    resStr = convertFromLegacyResolutionString(resStr)
-                    prefs.edit().putString(RESOLUTION_PREF_STRING, resStr).apply()
+                if (!resStrOg.contains("x")) {
+                    val resStrNew = convertFromLegacyResolutionString(resStrOg)
+                    prefs.edit().putString(RESOLUTION_PREF_STRING, resStrNew).apply()
                 }
 
-                config.width = getWidthFromResolutionString(resStr)
-                config.height = getHeightFromResolutionString(resStr)
+                config.width = res?.first ?: 1280
+                config.height = res?.second?: 720
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // Consider cutout when setting initial resolution
+                    val dc = displayCutoutP
+                    if (dc != null) {
+                        val cutoutRect = dc.boundingRectTop
+                        val cutoutWidth = cutoutRect.width()
+                        val cutoutHeight = cutoutRect.height()
+                        if (config.width > cutoutWidth && config.height > cutoutHeight) {
+                            config.width -= cutoutWidth
+                            config.height -= cutoutHeight
+                        }
+                    }
+                }
+
                 config.fps = prefs.getString(
                     FPS_PREF_STRING,
                     DEFAULT_FPS

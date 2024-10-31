@@ -1,10 +1,12 @@
 package com.limelight.preferences
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -57,6 +59,17 @@ class StreamSettings : Activity() {
         setContentView(R.layout.activity_stream_settings)
 
         UiHelper.notifyNewRootView(this)
+
+        // Handle cutout for Android 9 (Pie) where necessary
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.P) {
+            // Handle cutout on Android 9 using the available insets
+            val insets = window.decorView.rootWindowInsets
+            if (insets != null) {
+                displayCutoutP = insets.displayCutout
+            }
+        }
+
+        reloadSettings()
     }
 
     override fun onAttachedToWindow() {
@@ -105,7 +118,7 @@ class StreamSettings : Activity() {
             if (newPrefs.language != previousPrefs!!.language) {
                 // Restart the PC view to apply UI changes
                 val intent = Intent(this, PcView::class.java)
-                intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK)
+                intent.flags = Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK
                 startActivity(intent, null)
             }
         }
@@ -114,6 +127,19 @@ class StreamSettings : Activity() {
     class SettingsFragment : PreferenceFragment() {
         private var nativeResolutionStartIndex = Int.Companion.MAX_VALUE
         private var nativeFramerateShown = false
+
+        private fun getRecommendedCutoutArea(): Rect? {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && activity != null) {
+                val windowInsets = activity.window.decorView.rootWindowInsets
+                if (windowInsets != null) {
+                    val cutout = windowInsets.displayCutout
+                    if (cutout != null) {
+                        return cutout.boundingRectTop
+                    }
+                }
+            }
+            return null
+        }
 
         private fun setValue(preferenceKey: String?, value: String?) {
             val pref = findPreference(preferenceKey) as ListPreference
@@ -144,52 +170,73 @@ class StreamSettings : Activity() {
             insetsRemoved: Boolean,
             portrait: Boolean
         ) {
-            val pref =
-                findPreference(PreferenceConfiguration.Companion.RESOLUTION_PREF_STRING) as ListPreference
+            val pref = findPreference(PreferenceConfiguration.RESOLUTION_PREF_STRING) as ListPreference
 
-            var newName: String?
+            val newName = buildString {
+                append(if (insetsRemoved)
+                    resources.getString(R.string.resolution_prefix_native)
+                else
+                    resources.getString(R.string.resolution_prefix_native_fullscreen))
 
-            newName = if (insetsRemoved) {
-                getResources().getString(R.string.resolution_prefix_native_fullscreen)
+                if (PreferenceConfiguration.isSquarishScreen(nativeWidth, nativeHeight)) {
+                    append(" ")
+                    append(if (portrait)
+                        resources.getString(R.string.resolution_prefix_native_portrait)
+                    else
+                        resources.getString(R.string.resolution_prefix_native_landscape))
+                }
+                append(" ($nativeWidth x $nativeHeight)")
+            }
+
+            // Incorporate mode into entryValue
+            val mode = if (insetsRemoved) {
+                "native_cutout"
             } else {
-                getResources().getString(R.string.resolution_prefix_native)
+                "native"
             }
+            val newValue = "$mode|$nativeWidth" + "x" + "$nativeHeight"
 
-            if (PreferenceConfiguration.Companion.isSquarishScreen(nativeWidth, nativeHeight)) {
-                newName += if (portrait) {
-                    " " + getResources().getString(R.string.resolution_prefix_native_portrait)
-                } else {
-                    " " + getResources().getString(R.string.resolution_prefix_native_landscape)
-                }
-            }
-
-            newName += " (" + nativeWidth + "x" + nativeHeight + ")"
-
-            val newValue = nativeWidth.toString() + "x" + nativeHeight
-
-            // Check if the native resolution is already present
-            for (value in pref.entryValues) {
-                if (newValue == value.toString()) {
-                    // It is present in the default list, so don't add it again
-                    return
-                }
+            if (pref.entryValues.any { it == newValue }) {
+                return
             }
 
             if (pref.entryValues.size < nativeResolutionStartIndex) {
                 nativeResolutionStartIndex = pref.entryValues.size
             }
+
             appendPreferenceEntry(pref, newName, newValue)
         }
 
-        private fun addNativeResolutionEntries(
-            nativeWidth: Int,
-            nativeHeight: Int,
-            insetsRemoved: Boolean
-        ) {
-            if (PreferenceConfiguration.Companion.isSquarishScreen(nativeWidth, nativeHeight)) {
+        @SuppressLint("NewApi") // Hack for Android 9,
+        private fun addNativeResolutionEntries(nativeWidth: Int, nativeHeight: Int, insetsRemoved: Boolean) {
+            if (PreferenceConfiguration.isSquarishScreen(nativeWidth, nativeHeight)) {
                 addNativeResolutionEntry(nativeHeight, nativeWidth, insetsRemoved, true)
             }
             addNativeResolutionEntry(nativeWidth, nativeHeight, insetsRemoved, false)
+
+            // Handle the cutout area if present
+            val cutoutArea = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val insets = activity?.window?.decorView?.rootWindowInsets
+                insets?.displayCutout
+            } else {
+                displayCutoutP
+            }
+
+            cutoutArea?.let {
+                val widthInsets = it.safeInsetLeft + it.safeInsetRight
+                val heightInsets = it.safeInsetTop + it.safeInsetBottom
+
+                val adjustedWidth = nativeWidth - widthInsets
+                val adjustedHeight = nativeHeight - heightInsets
+
+                if (adjustedWidth > 0 && adjustedHeight > 0) {
+                    // Add Native Cutout resolution
+                    if (PreferenceConfiguration.isSquarishScreen(adjustedWidth, adjustedHeight)) {
+                        addNativeResolutionEntry(adjustedHeight, adjustedWidth, true, true)
+                    }
+                    addNativeResolutionEntry(adjustedWidth, adjustedHeight, true, false)
+                }
+            }
         }
 
         private fun addNativeFrameRateEntry(framerate: Float) {
@@ -201,7 +248,7 @@ class StreamSettings : Activity() {
             val pref =
                 findPreference(PreferenceConfiguration.Companion.FPS_PREF_STRING) as ListPreference
             val fpsValue = frameRateRounded.toString()
-            val fpsName = getResources().getString(R.string.resolution_prefix_native) +
+            val fpsName = getResources().getString(R.string.resolution_prefix_native_fullscreen) +
                     " (" + fpsValue + " " + getResources().getString(R.string.fps_suffix_fps) + ")"
 
             // Check if the native frame rate is already present
@@ -253,26 +300,27 @@ class StreamSettings : Activity() {
             pref.entryValues = entryValues
         }
 
-        private fun resetBitrateToDefault(prefs: SharedPreferences, res: String?, fps: String?) {
-            var res = res
-            var fps = fps
-            if (res == null) {
-                res = prefs.getString(
-                    PreferenceConfiguration.Companion.RESOLUTION_PREF_STRING,
-                    PreferenceConfiguration.Companion.DEFAULT_RESOLUTION
-                )
+        private fun resetBitrateToDefault(prefs: SharedPreferences, res: Pair<Int, Int>?, fps: String?) {
+            var resolution = res
+            var framerate = fps
+            if (resolution == null) {
+                val storedRes = prefs.getString(
+                    PreferenceConfiguration.RESOLUTION_PREF_STRING,
+                    PreferenceConfiguration.DEFAULT_RESOLUTION
+                )!!
+                val (_, resolution) = PreferenceConfiguration.parsePrefResolutionValue(storedRes)
             }
-            if (fps == null) {
-                fps = prefs.getString(
-                    PreferenceConfiguration.Companion.FPS_PREF_STRING,
-                    PreferenceConfiguration.Companion.DEFAULT_FPS
+            if (framerate == null) {
+                framerate = prefs.getString(
+                    PreferenceConfiguration.FPS_PREF_STRING,
+                    PreferenceConfiguration.DEFAULT_FPS
                 )
             }
 
             prefs.edit()
                 .putInt(
-                    PreferenceConfiguration.Companion.BITRATE_PREF_STRING,
-                    PreferenceConfiguration.Companion.getDefaultBitrate(res.toString(), fps.toString())
+                    PreferenceConfiguration.BITRATE_PREF_STRING,
+                    PreferenceConfiguration.getDefaultBitrate(resolution, framerate.toString())
                 )
                 .apply()
         }
@@ -382,43 +430,7 @@ class StreamSettings : Activity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 var maxSupportedResW = 0
 
-                // Add a native resolution with any insets included for users that don't want content
-                // behind the notch of their display
                 var hasInsets = false
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    var cutout: DisplayCutout?
-
-                    cutout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        // Use the much nicer Display.getCutout() API on Android 10+
-                        display.cutout
-                    } else {
-                        // Android 9 only
-                        displayCutoutP
-                    }
-
-                    if (cutout != null) {
-                        val widthInsets = cutout.safeInsetLeft + cutout.safeInsetRight
-                        val heightInsets = cutout.safeInsetBottom + cutout.safeInsetTop
-
-                        if (widthInsets != 0 || heightInsets != 0) {
-                            val metrics = DisplayMetrics()
-                            display.getRealMetrics(metrics)
-
-                            val width: Int = max(
-                                (metrics.widthPixels - widthInsets),
-                                (metrics.heightPixels - heightInsets)
-                            )
-                            val height: Int = min(
-                                (metrics.widthPixels - widthInsets),
-                                (metrics.heightPixels - heightInsets)
-                            )
-
-                            addNativeResolutionEntries(width, height, false)
-                            hasInsets = true
-                        }
-                    }
-                }
-
                 // Always allow resolutions that are smaller or equal to the active
                 // display resolution because decoders can report total non-sense to us.
                 // For example, a p201 device reports:
@@ -682,33 +694,25 @@ class StreamSettings : Activity() {
                         preference: Preference,
                         newValue: Any?
                     ): Boolean {
-                        val prefs =
-                            PreferenceManager.getDefaultSharedPreferences(this@SettingsFragment.activity)
+                        val prefs = PreferenceManager.getDefaultSharedPreferences(activity)
+
                         val valueStr = newValue as String
 
-                        // Detect if this value is the native resolution option
-                        val values = (preference as ListPreference).entryValues
-                        var isNativeRes = true
-                        for (i in values.indices) {
-                            // Look for a match prior to the start of the native resolution entries
-                            if (valueStr == values[i].toString() && i < nativeResolutionStartIndex) {
-                                isNativeRes = false
-                                break
-                            }
-                        }
+                        // Detect if this value is a native resolution option with mode
+                        val (mode, resolution) = PreferenceConfiguration.parsePrefResolutionValue(valueStr)
 
-                        // If this is native resolution, show the warning dialog
-                        if (isNativeRes) {
+                        // If mode is native, show the warning dialog
+                        if (mode?.startsWith("native") == true) {
                             Dialog.displayDialog(
                                 activity,
-                                getResources().getString(R.string.title_native_res_dialog),
-                                getResources().getString(R.string.text_native_res_dialog),
+                                getString(R.string.title_native_res_dialog),
+                                getString(R.string.text_native_res_dialog),
                                 false
                             )
                         }
 
                         // Write the new bitrate value
-                        resetBitrateToDefault(prefs, valueStr, null)
+                        resetBitrateToDefault(prefs, resolution, null)
 
                         // Allow the original preference change to take place
                         return true
